@@ -1,0 +1,2090 @@
+diff --git a/README.md b/README.md
+index 3ab1a41..f453bf0 100644
+--- a/README.md
++++ b/README.md
+@@ -226,6 +226,138 @@ Remember the guiding principle above: solutions are judged on whether they'd
+ 
+ ---
+ 
++## Reference solution (implemented)
++
++The two required challenges are implemented without changing the organiser's
++`csd/config.py` defaults or reading simulator internals.
++
++### Challenge 1 — training-free, physics-guided pixel detector
++
++`solutions/detection.py` builds a normalized matched-filter bank from the public
++appearance ranges: short dark rectangles, the nominal stick angle and its
++orientation jitter, and the configured blur. Before filtering, it subtracts a
++robust median from each row to suppress the shared horizontal acquisition noise.
++Each zero-sum template compares the putative stick to a local background annulus;
++non-maximum suppression keeps one centre per feature, and the selected blurred
++rectangle footprints form the binary pixel mask. The default threshold is 4
++matched-filter noise units. No generated training images, stick metadata, or
++hidden state are used at inference time.
++
++The detector also estimates the physical dip amplitude by dividing each matched
++response by the selected template's gain. This removes most of the square-root
++area advantage of longer/wider sticks and gives stage 2 an objective closer to
++"maximum interdot contrast" than image standard deviation.
++
++### Challenge 2 — global search, empirical drift correction, local refinement
++
++`solutions/optimization.py` only calls `experiment.start` and
++`experiment.measure`:
++
++1. Take a starting image and six small orthogonal barrier probes to identify the
++   local plunger response.
++2. Track the shared stick geometry between adjacent scans using a bounded
++   cross-correlation of row-corrected edge maps. Ambiguous registrations trigger
++   a repeated frame and averaging. A robust linear model is fit first; a
++   regularized quadratic model is enabled when the observations span it.
++3. Explore the default `[-0.5, 0.5]^3` barrier cube with 48 scrambled Sobol
++   points, routed in nearest-neighbour order. Intermediate moves are also scored
++   and are limited to 0.08 V per barrier, so the image remains trackable while
++   `g2/g4` are recentered from measurements.
++4. Refine two spatially separated high-scoring starts by coordinate pattern
++   search (±0.08, 0.04, 0.02, then 0.01 V). Local comparisons average two
++   frames; the returned point is confirmed with three more frames.
++
++The objective is the largest gain-corrected, detector-derived stick amplitude in
++a full-resolution CSD frame. This matches the challenge's maximum-contrast
++definition and avoids both scene-wide dilution and the pixel-area bias in a raw
++matched-filter response.
++
++### Run the solutions
++
++```bash
++# Reproducible held-out detector data. Do not reuse the test seed for tuning.
++uv run python starter/stage1_detection/generate_data.py --n 100 --out data/val  --seed 999
++uv run python starter/stage1_detection/generate_data.py --n 120 --out data/test --seed 2026
++uv run python -m solutions.evaluate_detection --dataset data/test
++
++# One deterministic optimization run; no reveal() call is made by the optimizer.
++uv run python - <<'PY'
++from csd import new_experiment
++from solutions.optimization import ContrastOptimizer
++
++exp = new_experiment(seed=0)
++result = ContrastOptimizer(seed=0).optimize(exp)
++print("working point:", result.working_point)
++print("image-derived score:", result.score)
++print("measurements / pixels:", result.n_measurements, result.n_pixels)
++PY
++
++# Multi-device post-run self-check (reveal is called only after optimize returns).
++uv run python -m solutions.evaluate_optimization \
++  --count 10 --start-seed 0 --optimizer-seed 0 \
++  --global-samples 48 --csv results/optimization_benchmark.csv
++```
++
++Generated `.npy` datasets stay under the ignored `data/` directory. The detector
++is analytic, not trained, so the validation split is used only to choose the
++segmentation threshold; the seed-2026 test split is held out. The benchmark's
++oracle measurements and calls to `reveal()` are separate post-run self-checks,
++never inputs to the optimizer, and are not included in its pixel budget.
++
++### Reproducible results
++
++On 120 held-out images generated with seed `2026` (threshold fixed at `4.0` using
++100 validation images, seed `999`):
++
++| Metric | Result |
++|---|---:|
++| Macro pixel precision / recall | 0.640 / 0.918 |
++| Macro pixel F1 / IoU | **0.746 / 0.608** |
++| Micro pixel precision / recall | 0.644 / 0.921 |
++| Micro pixel F1 / IoU | 0.758 / 0.610 |
++| 8-connected object precision / recall | 0.718 / 0.931 |
++
++Pixel accuracy is intentionally omitted because the positive class occupies
++well under 1% of the pixels. The object metric counts a target stick as found
++when any predicted foreground overlaps its 8-connected component.
++
++For stage 2, the checked-in `results/optimization_benchmark.csv` contains 10
++fresh devices (seeds 0–9), all using optimizer seed 0 and the default budget.
++The metric is the repeated, detector-derived contrast score at the returned
++point divided by the same score measured at the revealed optimum **after** the
++optimizer has finished. The mean ratio was **0.874**, the median **0.857**, and
++the minimum **0.745**. The median search used **334.5 measurements** and
++**7,526,250 integrated pixels** (range: 325–397 measurements). The initial
++working point had a median score ratio of 0.150. A noisy measured ratio can
++occasionally exceed 1; it is a self-check on an image-derived proxy, not a claim
++that physical contrast exceeds the hidden maximum.
++
++See `assets/detection_example.png` and `assets/optimization_benchmark.png` for
++the held-out detector overlay and ten-device optimization plot. `slides.pptx`
++and `slides.md` provide the 10-minute presentation and speaker notes. To
++regenerate the editable deck, activate the project environment, install the
++optional `python-pptx` generator dependency, and run
++`python presentation/create_slides.py`.
++
++### Limitations and next steps
++
++- The detector assumes the known baseline stick scale and near-45-degree
++  orientation. A real deployment should estimate these from a small calibration
++  set or widen the bank if device geometry changes. Short connector segments and
++  exceptionally weak sticks remain its main false-positive/false-negative modes.
++- Gain correction reduces, but does not eliminate, shape-dependent selection
++  bias in the strongest-stick score. A calibrated local contrast-to-noise
++  estimator with uncertainty would make fine tuning more reliable.
++- Image registration can become ambiguous if all sticks are near the noise
++  floor or move outside the scan. The optimizer detects low-confidence matches
++  and repeats them, but it still depends on locally trackable geometry and uses
++  a smooth linear/quadratic drift approximation.
++- The optimizer is robust but not perfect: a ten-device median score ratio of
++  0.857 leaves room for a more sample-efficient Bayesian or trust-region search,
++  multi-resolution overviews, and explicit uncertainty-aware stopping.
++
++---
++
+ ## Repository layout
+ 
+ ```
+@@ -238,7 +370,19 @@ csd/                       # the engine — provided
+ starter/                   # illustrative starting points — edit freely
+   stage1_detection/        #   generate_data.py, explore_data.py
+   stage2_optimization/     #   optimize.py, explore_simulator.py
+-data/                      # your generated datasets land here
++solutions/                 # reference detector, optimizer, and evaluators
++  detection.py             #   matched-filter detector + pixel metrics
++  optimization.py          #   API-only drift tracking and contrast search
++  evaluate_detection.py    #   held-out mask and object metrics
++  evaluate_optimization.py #   post-run, reveal-based self-check
++assets/                    # figures used by README and slides
++results/                   # reproducible ten-device benchmark CSV
++presentation/              # editable-deck generation script
++  create_slides.py         #   rebuilds slides.pptx (requires python-pptx)
++tests/                     # focused unit and API-boundary tests
++data/                      # generated datasets (ignored by git)
++slides.pptx                # editable 10-minute presentation
++slides.md                  # slide text and speaker notes
+ pyproject.toml
+ ```
+ 
+diff --git a/assets/detection_example.png b/assets/detection_example.png
+new file mode 100644
+index 0000000..ac53dcd
+Binary files /dev/null and b/assets/detection_example.png differ
+diff --git a/assets/optimization_benchmark.png b/assets/optimization_benchmark.png
+new file mode 100644
+index 0000000..d5aab5d
+Binary files /dev/null and b/assets/optimization_benchmark.png differ
+diff --git a/presentation/create_slides.py b/presentation/create_slides.py
+new file mode 100644
+index 0000000..cddca20
+--- /dev/null
++++ b/presentation/create_slides.py
+@@ -0,0 +1,516 @@
++"""Create the editable 16:9 presentation deck (requires python-pptx)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from pptx import Presentation
++from pptx.dml.color import RGBColor
++from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
++from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
++from pptx.util import Inches, Pt
++
++ROOT = Path(__file__).resolve().parents[1]
++OUT = ROOT / "slides.pptx"
++
++NAVY = RGBColor(8, 24, 37)
++PANEL = RGBColor(16, 39, 57)
++PANEL_2 = RGBColor(21, 49, 69)
++WHITE = RGBColor(237, 244, 250)
++MUTED = RGBColor(166, 184, 199)
++TEAL = RGBColor(51, 211, 194)
++ORANGE = RGBColor(255, 157, 81)
++PINK = RGBColor(255, 104, 151)
++BLUE = RGBColor(94, 176, 255)
++
++prs = Presentation()
++prs.slide_width = Inches(13.333)
++prs.slide_height = Inches(7.5)
++blank = prs.slide_layouts[6]
++
++
++def _background(slide) -> None:
++    fill = slide.background.fill
++    fill.solid()
++    fill.fore_color.rgb = NAVY
++
++
++def _text(
++    slide,
++    text: str,
++    x: float,
++    y: float,
++    w: float,
++    h: float,
++    *,
++    size: float = 18,
++    color=WHITE,
++    bold: bool = False,
++    font: str = "Aptos",
++    align=PP_ALIGN.LEFT,
++    valign=MSO_ANCHOR.TOP,
++) -> None:
++    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
++    frame = box.text_frame
++    frame.clear()
++    frame.word_wrap = True
++    frame.margin_left = Inches(0.02)
++    frame.margin_right = Inches(0.02)
++    frame.margin_top = Inches(0.01)
++    frame.margin_bottom = Inches(0.01)
++    frame.vertical_anchor = valign
++    paragraph = frame.paragraphs[0]
++    paragraph.alignment = align
++    paragraph.space_after = Pt(0)
++    run = paragraph.add_run()
++    run.text = text
++    run.font.name = font
++    run.font.size = Pt(size)
++    run.font.bold = bold
++    run.font.color.rgb = color
++    return box
++
++
++def _card(slide, x: float, y: float, w: float, h: float, fill=PANEL, line=None) -> None:
++    shape = slide.shapes.add_shape(
++        MSO_SHAPE.ROUNDED_RECTANGLE,
++        Inches(x),
++        Inches(y),
++        Inches(w),
++        Inches(h),
++    )
++    shape.fill.solid()
++    shape.fill.fore_color.rgb = fill
++    shape.line.color.rgb = line or fill
++    shape.adjustments[0] = 0.08
++    return shape
++
++
++def _line(
++    slide, x1: float, y1: float, x2: float, y2: float, color=TEAL, width: float = 1.5
++) -> None:
++    shape = slide.shapes.add_connector(
++        MSO_CONNECTOR.STRAIGHT,
++        Inches(x1),
++        Inches(y1),
++        Inches(x2),
++        Inches(y2),
++    )
++    shape.line.color.rgb = color
++    shape.line.width = Pt(width)
++    return shape
++
++
++def _header(slide, number: int, title: str, kicker: str | None = None) -> None:
++    _background(slide)
++    if kicker:
++        _text(slide, kicker.upper(), 0.7, 0.34, 6.0, 0.28, size=10, color=TEAL, bold=True)
++    _text(slide, title, 0.7, 0.72, 11.9, 0.72, size=30, bold=True)
++    _line(slide, 0.7, 1.57, 12.62, 1.57, color=PANEL_2, width=1.2)
++    _text(slide, f"C12  /  {number:02d}", 0.7, 7.12, 2.0, 0.2, size=9, color=MUTED)
++    _text(
++        slide,
++        "MEASURE  ·  INFER  ·  TUNE",
++        9.4,
++        7.12,
++        3.2,
++        0.2,
++        size=9,
++        color=MUTED,
++        align=PP_ALIGN.RIGHT,
++    )
++
++
++def _bullet(slide, text: str, x: float, y: float, w: float, *, color=WHITE, size=16) -> None:
++    _text(slide, "•", x, y, 0.25, 0.36, size=size + 1, color=TEAL, bold=True)
++    _text(slide, text, x + 0.28, y, w - 0.28, 0.52, size=size, color=color)
++
++
++def _image_fit(slide, path: Path, x: float, y: float, w: float, h: float) -> None:
++    picture = slide.shapes.add_picture(str(path), Inches(x), Inches(y))
++    image_ratio = picture.width / picture.height
++    box_ratio = w / h
++    if image_ratio > box_ratio:
++        picture.width = Inches(w)
++        picture.height = int(picture.width / image_ratio)
++        picture.left = Inches(x)
++        picture.top = Inches(y + (h - picture.height / 914400) / 2)
++    else:
++        picture.height = Inches(h)
++        picture.width = int(picture.height * image_ratio)
++        picture.left = Inches(x + (w - picture.width / 914400) / 2)
++        picture.top = Inches(y)
++    return picture
++
++
++# 1 — Cover -----------------------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_background(slide)
++_card(slide, 8.72, 0.78, 3.83, 5.93, fill=PANEL)
++_text(
++    slide,
++    "C12 HACKATHON  /  REFERENCE SOLUTION",
++    0.82,
++    0.72,
++    6.6,
++    0.35,
++    size=11,
++    color=TEAL,
++    bold=True,
++)
++_text(slide, "AUTOMATE\nCSD CALIBRATION", 0.78, 1.43, 7.5, 2.05, size=38, color=WHITE, bold=True)
++_text(
++    slide,
++    "Detect the sticks. Measure their contrast.\nRecenter as the barriers move the scene.",
++    0.84,
++    3.78,
++    7.1,
++    0.85,
++    size=20,
++    color=MUTED,
++)
++_text(
++    slide,
++    "A physics-guided detector + a drift-aware global optimizer",
++    0.84,
++    5.35,
++    7.2,
++    0.4,
++    size=14,
++    color=TEAL,
++    bold=True,
++)
++for idx, (num, label, detail) in enumerate(
++    [
++        ("01", "DETECT", "short dark sticks"),
++        ("02", "QUANTIFY", "local contrast"),
++        ("03", "RECENTER", "plunger plane"),
++    ]
++):
++    yy = 1.28 + idx * 1.62
++    _text(slide, num, 9.12, yy, 0.55, 0.44, size=22, color=TEAL, bold=True)
++    _text(slide, label, 9.87, yy, 2.1, 0.36, size=15, color=WHITE, bold=True)
++    _text(slide, detail, 9.87, yy + 0.44, 2.15, 0.35, size=13, color=MUTED)
++    if idx < 2:
++        _line(slide, 9.16, yy + 0.68, 12.08, yy + 0.68, color=PANEL_2, width=1.0)
++_text(
++    slide, "10 MIN  ·  ENGLISH  ·  REPRODUCIBLE SEEDS", 0.82, 7.08, 6.7, 0.22, size=9, color=MUTED
++)
++
++# 2 — What the detector sees -----------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 2, "A sparse target inside a noisy map", "01 / Detection")
++_card(slide, 0.72, 1.85, 3.12, 4.74)
++_text(slide, "WHAT COUNTS AS A STICK?", 1.0, 2.16, 2.55, 0.32, size=12, color=TEAL, bold=True)
++_bullet(slide, "Short and dark", 1.0, 2.82, 2.55, size=15)
++_bullet(slide, "Near 45° orientation", 1.0, 3.56, 2.55, size=15)
++_bullet(slide, "Only a few pixels wide", 1.0, 4.30, 2.55, size=15)
++_line(slide, 1.0, 5.12, 3.55, 5.12, color=PANEL_2)
++_text(
++    slide,
++    "Row stripes and long charging-line connectors are nuisance structure, not labels.",
++    1.0,
++    5.38,
++    2.52,
++    0.82,
++    size=13,
++    color=MUTED,
++)
++_card(slide, 4.08, 1.85, 8.48, 4.74, fill=WHITE)
++_image_fit(slide, ROOT / "assets/detection_example.png", 4.17, 2.20, 8.30, 3.98)
++_text(
++    slide,
++    "Raw CSD  →  ground truth  →  detector overlay",
++    4.22,
++    6.22,
++    8.1,
++    0.25,
++    size=11,
++    color=MUTED,
++    align=PP_ALIGN.CENTER,
++)
++
++# 3 — Detector architecture -------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 3, "Matched filters grounded in device geometry", "01 / Detection")
++steps = [
++    ("1", "ROW BASELINE", "Subtract each row's median to suppress shared horizontal noise."),
++    (
++        "2",
++        "TEMPLATE BANK",
++        "Blurred, zero-sum dark rectangles across physical length, width, and angle.",
++    ),
++    ("3", "MASK", "Noise-normalized response → non-maximum suppression → winning footprint."),
++]
++for idx, (num, title, detail) in enumerate(steps):
++    x = 0.78 + idx * 4.15
++    _card(slide, x, 2.05, 3.7, 2.48, fill=PANEL)
++    _text(slide, num, x + 0.25, 2.28, 0.55, 0.55, size=28, color=TEAL, bold=True)
++    _text(slide, title, x + 0.88, 2.36, 2.55, 0.36, size=13, bold=True)
++    _text(slide, detail, x + 0.28, 3.13, 3.1, 1.04, size=15, color=MUTED)
++    if idx < 2:
++        _text(slide, "→", x + 3.76, 2.99, 0.35, 0.42, size=24, color=TEAL, bold=True)
++_card(slide, 0.78, 4.93, 11.82, 1.28, fill=PANEL_2)
++_text(slide, "WHY THIS MODEL?", 1.05, 5.17, 1.8, 0.28, size=11, color=TEAL, bold=True)
++_text(
++    slide,
++    "Known geometry is a transferable prior; no training-set leakage, metadata input, or image normalization.",
++    3.0,
++    5.14,
++    9.1,
++    0.52,
++    size=16,
++    color=WHITE,
++)
++_text(
++    slide,
++    "Segmentation threshold fixed at 4.0 on validation seed 999.",
++    1.05,
++    5.73,
++    10.4,
++    0.25,
++    size=11,
++    color=MUTED,
++)
++
++# 4 — Detection metrics -----------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 4, "Held-out detection: high recall, transparent trade-off", "01 / Validation")
++_text(slide, "120", 0.92, 2.02, 2.2, 0.8, size=44, color=TEAL, bold=True)
++_text(slide, "held-out images\nseed 2026", 0.98, 2.90, 2.5, 0.7, size=16, color=MUTED)
++_card(slide, 3.45, 1.95, 4.05, 3.9, fill=PANEL)
++_text(slide, "PIXEL MASK", 3.78, 2.28, 2.4, 0.35, size=13, color=TEAL, bold=True)
++_text(slide, "0.746", 3.78, 2.82, 2.7, 0.75, size=42, bold=True)
++_text(slide, "macro F1", 3.80, 3.55, 2.4, 0.32, size=15, color=MUTED)
++_line(slide, 3.80, 4.08, 7.07, 4.08, color=PANEL_2)
++_text(slide, "0.608", 3.80, 4.30, 1.55, 0.55, size=27, color=WHITE, bold=True)
++_text(slide, "macro IoU", 5.28, 4.41, 1.7, 0.28, size=13, color=MUTED)
++_card(slide, 7.83, 1.95, 4.05, 3.9, fill=PANEL)
++_text(slide, "OBJECT-LEVEL", 8.16, 2.28, 2.5, 0.35, size=13, color=TEAL, bold=True)
++_text(slide, "0.931", 8.16, 2.82, 2.7, 0.75, size=42, bold=True)
++_text(slide, "stick recall", 8.18, 3.55, 2.4, 0.32, size=15, color=MUTED)
++_line(slide, 8.18, 4.08, 11.45, 4.08, color=PANEL_2)
++_text(slide, "0.718", 8.18, 4.30, 1.55, 0.55, size=27, color=WHITE, bold=True)
++_text(slide, "object precision", 9.67, 4.41, 1.9, 0.28, size=13, color=MUTED)
++_text(
++    slide,
++    "Validation: 100 images / seed 999  ·  Test threshold untouched  ·  8-connected overlap defines an object hit",
++    0.95,
++    6.25,
++    11.6,
++    0.4,
++    size=12,
++    color=MUTED,
++)
++
++# 5 — Challenge 2 objective -------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 5, "Optimize the strongest interdot, not image standard deviation", "02 / Objective")
++_card(slide, 0.78, 1.95, 5.62, 4.68, fill=PANEL)
++_text(slide, "THE FIVE GATES", 1.12, 2.28, 2.1, 0.32, size=12, color=TEAL, bold=True)
++_text(slide, "g1  ·  g3  ·  g5", 1.12, 2.82, 4.5, 0.5, size=27, bold=True)
++_text(slide, "barriers: contrast + drift", 1.14, 3.34, 4.55, 0.38, size=15, color=MUTED)
++_line(slide, 1.12, 4.05, 5.98, 4.05, color=PANEL_2)
++_text(slide, "g2  ·  g4", 1.12, 4.42, 4.5, 0.5, size=27, color=WHITE, bold=True)
++_text(slide, "plungers: recenter the scan", 1.14, 4.94, 4.55, 0.38, size=15, color=MUTED)
++_card(slide, 6.75, 1.95, 5.83, 4.68, fill=PANEL_2)
++_text(slide, "MEASUREMENT OBJECTIVE", 7.10, 2.28, 3.7, 0.32, size=12, color=TEAL, bold=True)
++_text(slide, "strongest local dip", 7.10, 2.88, 4.9, 0.56, size=27, bold=True)
++_text(slide, "matched response ÷ template gain", 7.12, 3.52, 4.95, 0.38, size=16, color=MUTED)
++_text(
++    slide,
++    "Removes most pixel-area bias while avoiding scene-wide dilution.",
++    7.12,
++    4.35,
++    4.7,
++    0.72,
++    size=17,
++    color=WHITE,
++)
++_text(
++    slide,
++    "Objective uses measured images only.",
++    7.12,
++    5.72,
++    4.5,
++    0.32,
++    size=13,
++    color=TEAL,
++    bold=True,
++)
++
++# 6 — Drift correction ------------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 6, "Drift correction is part of the experiment", "02 / Tracking")
++flow = [
++    (0.86, "BARRIER\nSTEP", "gates change"),
++    (3.95, "IMAGE\nSHIFT", "sticks move"),
++    (7.04, "REGISTER\nEDGES", "estimate Δx, Δy"),
++    (10.13, "PAN\nWINDOW", "keep sticks visible"),
++]
++for idx, (x, title, sub) in enumerate(flow):
++    _card(slide, x, 2.16, 2.35, 1.72, fill=PANEL if idx != 2 else PANEL_2)
++    _text(
++        slide,
++        title,
++        x + 0.18,
++        2.46,
++        1.98,
++        0.74,
++        size=18,
++        color=TEAL if idx == 2 else WHITE,
++        bold=True,
++        align=PP_ALIGN.CENTER,
++    )
++    _text(slide, sub, x + 0.18, 3.32, 1.98, 0.27, size=11, color=MUTED, align=PP_ALIGN.CENTER)
++    if idx < 3:
++        _text(slide, "→", x + 2.49, 2.75, 0.45, 0.42, size=25, color=TEAL, bold=True)
++_card(slide, 0.86, 4.48, 11.62, 1.48, fill=PANEL_2)
++_text(slide, "CALIBRATE", 1.18, 4.80, 1.35, 0.28, size=11, color=TEAL, bold=True)
++_text(slide, "6 orthogonal probes", 1.18, 5.20, 2.2, 0.3, size=14)
++_text(slide, "FIT", 4.18, 4.80, 0.8, 0.28, size=11, color=TEAL, bold=True)
++_text(slide, "robust linear → quadratic drift", 4.18, 5.20, 3.3, 0.3, size=14)
++_text(slide, "GUARD", 8.20, 4.80, 1.1, 0.28, size=11, color=TEAL, bold=True)
++_text(slide, "ambiguous match → repeat + average", 8.20, 5.20, 3.8, 0.3, size=14)
++_text(
++    slide,
++    "Relative registration only: no known drift matrix, reveal(), or simulator attributes.",
++    1.1,
++    6.30,
++    11.2,
++    0.3,
++    size=12,
++    color=MUTED,
++)
++
++# 7 — Search plan -----------------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 7, "Global exploration → local pattern search", "02 / Search")
++_card(slide, 0.84, 1.98, 5.55, 4.7, fill=PANEL)
++_text(slide, "01  GLOBAL", 1.18, 2.30, 2.1, 0.35, size=13, color=TEAL, bold=True)
++_text(slide, "48 scrambled Sobol points", 1.18, 2.88, 4.6, 0.42, size=21, bold=True)
++_text(slide, "3-D barrier cube: [−0.5, 0.5]³", 1.18, 3.42, 4.7, 0.34, size=14, color=MUTED)
++_line(slide, 1.18, 4.05, 5.98, 4.05, color=PANEL_2)
++_text(slide, "Trackable route", 1.18, 4.38, 2.3, 0.35, size=17, bold=True)
++_text(
++    slide,
++    "Nearest-neighbour order; each barrier move ≤ 0.08 V. Intermediate measurements still contribute scores.",
++    1.18,
++    4.85,
++    4.65,
++    0.93,
++    size=14,
++    color=MUTED,
++)
++_card(slide, 6.82, 1.98, 5.64, 4.7, fill=PANEL_2)
++_text(slide, "02  LOCAL", 7.18, 2.30, 2.0, 0.35, size=13, color=TEAL, bold=True)
++_text(slide, "Two separated starts", 7.18, 2.88, 4.6, 0.42, size=21, bold=True)
++for idx, (val, label) in enumerate(
++    [("0.08 V", "explore"), ("0.04 V", "refine"), ("0.02 V", "refine"), ("0.01 V", "confirm")]
++):
++    x = 7.18 + idx * 1.22
++    _card(slide, x, 3.77, 1.02, 0.94, fill=PANEL)
++    _text(
++        slide,
++        val,
++        x + 0.04,
++        3.96,
++        0.94,
++        0.25,
++        size=13,
++        color=WHITE,
++        bold=True,
++        align=PP_ALIGN.CENTER,
++    )
++    _text(slide, label, x + 0.04, 4.30, 0.94, 0.22, size=9, color=MUTED, align=PP_ALIGN.CENTER)
++    if idx < 3:
++        _text(slide, "→", x + 1.04, 4.04, 0.2, 0.28, size=15, color=TEAL, bold=True)
++_text(
++    slide,
++    "Coordinate pattern search · 2 frames for local comparisons · 3-frame final score",
++    7.18,
++    5.20,
++    4.65,
++    0.78,
++    size=14,
++    color=MUTED,
++)
++
++# 8 — Results ---------------------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 8, "Ten fresh devices: strong measured-score recovery", "02 / Results")
++_image_fit(slide, ROOT / "assets/optimization_benchmark.png", 0.77, 1.84, 8.85, 4.95)
++_card(slide, 9.88, 1.95, 2.62, 4.54, fill=PANEL)
++_text(slide, "0.874", 10.17, 2.30, 2.1, 0.7, size=36, color=TEAL, bold=True, align=PP_ALIGN.CENTER)
++_text(
++    slide, "mean score ratio", 10.11, 3.03, 2.2, 0.32, size=13, color=MUTED, align=PP_ALIGN.CENTER
++)
++_line(slide, 10.20, 3.63, 12.18, 3.63, color=PANEL_2)
++_text(
++    slide, "0.857", 10.17, 3.88, 2.1, 0.58, size=29, color=WHITE, bold=True, align=PP_ALIGN.CENTER
++)
++_text(slide, "median ratio", 10.11, 4.46, 2.2, 0.30, size=13, color=MUTED, align=PP_ALIGN.CENTER)
++_text(
++    slide,
++    "334.5 scans\n7.53M pixels\nmedian budget",
++    10.12,
++    5.12,
++    2.14,
++    0.90,
++    size=14,
++    color=WHITE,
++    align=PP_ALIGN.CENTER,
++)
++_text(
++    slide,
++    "Oracle measurements are post-run self-checks and excluded from the optimizer budget. Ratios are noisy image-derived proxies.",
++    0.92,
++    6.68,
++    11.5,
++    0.28,
++    size=10,
++    color=MUTED,
++)
++
++# 9 — Limits and take-away --------------------------------------------------
++slide = prs.slides.add_slide(blank)
++_header(slide, 9, "What transfers — and what we would improve next", "03 / Outlook")
++for x, title, body, color in [
++    (
++        0.86,
++        "TRANSFER",
++        "Physical template prior\nRow-noise suppression\nFixed-seed evaluation",
++        TEAL,
++    ),
++    (
++        4.93,
++        "LIMITS",
++        "Known stick geometry\nAmbiguous low-SNR drift\nNoisy strongest-stick estimate",
++        ORANGE,
++    ),
++    (
++        9.00,
++        "NEXT",
++        "Uncertainty-aware CNR\nMulti-resolution scans\nBayesian / trust-region search",
++        BLUE,
++    ),
++]:
++    _card(slide, x, 2.02, 3.48, 2.55, fill=PANEL)
++    _text(slide, title, x + 0.28, 2.33, 2.9, 0.35, size=13, color=color, bold=True)
++    _text(slide, body, x + 0.28, 2.98, 2.9, 1.26, size=15, color=WHITE)
++_card(slide, 0.86, 5.13, 11.62, 1.20, fill=PANEL_2)
++_text(slide, "TAKE-AWAY", 1.18, 5.48, 1.35, 0.3, size=12, color=TEAL, bold=True)
++_text(
++    slide,
++    "Build the objective from physics. Track the scene. Keep the oracle outside the algorithm.",
++    2.83,
++    5.40,
++    8.95,
++    0.46,
++    size=18,
++    color=WHITE,
++    bold=True,
++)
++
++prs.save(OUT)
++print(f"wrote {OUT}")
+diff --git a/pyproject.toml b/pyproject.toml
+index 8d35d34..932180b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -21,7 +21,7 @@ dependencies = [
+ dev = ["pytest", "ruff"]
+ 
+ [tool.hatch.build.targets.wheel]
+-packages = ["csd"]
++packages = ["csd", "solutions"]
+ 
+ [tool.ruff]
+ line-length = 100
+diff --git a/results/optimization_benchmark.csv b/results/optimization_benchmark.csv
+new file mode 100644
+index 0000000..9ed4f62
+--- /dev/null
++++ b/results/optimization_benchmark.csv
+@@ -0,0 +1,11 @@
++device_seed,optimizer_seed,initial_score,found_score,oracle_score,measured_score_ratio,barrier_distance_v,n_measurements,n_pixels,oracle_factor
++0.0,0.0,5.514908690916705,26.85630596026134,36.02507058930942,0.7454893362021906,0.04881595037344308,326.0,7335000.0,32.97209935789211
++1.0,0.0,3.8376106474112626,21.169517892693648,28.338359237152986,0.74702694378083,0.45971142677312254,341.0,7672500.0,32.17297704790903
++2.0,0.0,3.685203366403725,26.697954507852433,23.81798868433648,1.1209155761086542,0.047934704160215044,325.0,7312500.0,29.830648223096254
++3.0,0.0,12.006212416095643,26.883219378559758,33.25024526346605,0.8085119121842356,0.5942506252559603,334.0,7515000.0,30.345771514092142
++4.0,0.0,5.636064698782791,27.36006332016245,30.379263259908168,0.9006164200258869,0.8904718409128668,334.0,7515000.0,32.29774695308066
++5.0,0.0,5.227619497327371,17.157437108786144,20.836690735222874,0.8234242820421946,0.38272718340385503,397.0,8932500.0,27.930230187317427
++6.0,0.0,3.4539278680958594,28.12688479486665,31.565092821855586,0.8910756243806028,0.04579374713895921,335.0,7537500.0,29.799176611640224
++7.0,0.0,3.8560637176679067,23.32758537765963,29.666550511809746,0.7863261813460017,0.5128417330445777,341.0,7672500.0,30.97069428752046
++8.0,0.0,3.980178077608795,29.252747075356222,29.67500104284581,0.9857707176865833,0.02752908958185107,333.0,7492500.0,28.909028517654114
++9.0,0.0,3.63832723034267,22.843560069535965,24.61199947434247,0.928147267894668,0.023450654459784684,355.0,7987500.0,30.082069141031724
+diff --git a/slides.md b/slides.md
+new file mode 100644
+index 0000000..01f570d
+--- /dev/null
++++ b/slides.md
+@@ -0,0 +1,134 @@
++# C12 Hackathon — automated CSD detection and tuning
++
++**10-minute presentation plan (English).** The editable deck is `slides.pptx`; slide images are in `assets/`.
++
++---
++
++## Slide 1 — Automate what an experimentalist can actually see (0:45)
++
++**On slide**
++- Challenge 1: find interdot pixels from a raw charge-stability diagram.
++- Challenge 2: maximize interdot contrast on a fresh, hidden device.
++- Principle: use measured images and physical calibration logic, not hidden state.
++
++**Speaker notes**
++A double-quantum-dot device is tuned through a charge-stability diagram in the two plunger gates. The simulator gives us a controlled sandbox, but the method should be defensible on a real instrument: every decision should come from an image we could actually measure. I will show a physics-guided detector and a drift-aware global optimizer.
++
++---
++
++## Slide 2 — What is an interdot in the image? (1:00)
++
++**On slide**
++- Interdots are short, dark, approximately diagonal “sticks”.
++- Horizontal row noise and charging-line connectors are nuisance structure.
++- The label is a sparse pixel mask, not a scene classification.
++
++![Raw CSD, labels, and predictions](assets/detection_example.png)
++
++**Speaker notes**
++The target is very sparse: less than one percent of pixels are interdot pixels. A global threshold or image standard deviation sees the noise floor and the longer charging lines. The useful prior is local shape: sticks have a known size range, a nominal angle near forty-five degrees, and finite blur. The overlay shows that distinction and also makes our remaining false positives visible.
++
++---
++
++## Slide 3 — Detector: matched filters grounded in device geometry (1:20)
++
++**On slide**
++1. Subtract each row's robust median to suppress horizontal acquisition noise.
++2. Correlate with a bank of blurred, zero-sum stick templates over length, width, and angle.
++3. Non-maximum suppress centre responses; rasterize the winning template footprint.
++
++**Speaker notes**
++This detector is analytic and training-free. We build templates in physical volts from the public generator ranges, include the configured blur, and estimate local background with an annulus. L2 normalization makes responses comparable across templates; a threshold of four noise units was chosen on a separate validation seed. We do not use `sticks.jsonl` at inference time. This is a good baseline when the geometry is known, and it is also easy to explain to a device physicist.
++
++---
++
++## Slide 4 — Held-out detection results (1:00)
++
++**On slide**
++
++| Test metric (120 images, seed 2026) | Result |
++|---|---:|
++| Macro pixel F1 / IoU | **0.746 / 0.608** |
++| Micro pixel precision / recall | 0.644 / 0.921 |
++| 8-connected object precision / recall | 0.718 / 0.931 |
++
++Threshold selection: 100 validation images, seed 999. No training examples are needed.
++
++**Speaker notes**
++Accuracy would be misleading because background pixels dominate, so I report foreground precision, recall, F1, and intersection-over-union. The detector is recall-oriented: it finds about ninety-three percent of connected target sticks, with some false positives from noise and line fragments. The test set uses an independent fixed seed, and the threshold is not retuned on it.
++
++---
++
++## Slide 5 — Stage 2: optimize contrast, not a diluted image statistic (1:00)
++
++**On slide**
++- Barriers `g1/g3/g5` set contrast **and** move the sticks.
++- Plungers `g2/g4` recenter the scan window.
++- Objective: strongest gain-corrected detected-stick amplitude.
++
++**Speaker notes**
++There are several spatial regions with different barrier sweet-spots. A whole-frame standard deviation dilutes a bright patch over empty pixels and can prefer a region with more or larger sticks. Our detector response is divided by the template's amplitude gain, which reduces the square-root-of-area bias. We then use the strongest local estimated dip, matching the challenge's maximum-interdot definition. Repeated frames are used in local refinement to limit winner's-curse noise.
++
++---
++
++## Slide 6 — Track barrier-induced drift from measurements (1:20)
++
++**On slide**
++- Six small, orthogonal barrier probes estimate local lever arms.
++- Bounded cross-correlation tracks row-corrected image edges.
++- Fit a robust linear drift model, then a regularized quadratic model.
++- Ambiguous registration → repeat and average; never inspect simulator state.
++
++**Speaker notes**
++A barrier move changes both the objective and the location of the scene. If we fail to recenter, we may conclude that the contrast disappeared when it merely moved off-screen. We estimate translation between adjacent scans, account for the known plunger change, and update a smooth empirical drift model. A cross-correlation confidence check requests another acquisition when the image match is ambiguous. This is the most device-like part of the optimizer, and it is also a current limitation when all features are near the noise floor.
++
++---
++
++## Slide 7 — Global Sobol exploration, then local pattern search (1:15)
++
++**On slide**
++- 48 scrambled Sobol points span `[-0.5, 0.5]^3`.
++- Nearest-neighbour route; intermediate moves are scored and limited to 0.08 V.
++- Refine two separated high-scoring starts at 0.08 → 0.04 → 0.02 → 0.01 V.
++- Reconfirm the final working point with repeated scans.
++
++**Speaker notes**
++A local coordinate ascent alone can stall in one of the four contrast regions. The low-discrepancy global design gives broad coverage in three dimensions, while the route makes drift tracking possible and ensures navigation scans still contribute objective data. We take two separated promising points into a small coordinate pattern search. This is intentionally simple and interpretable; a Gaussian-process search is a natural next step if we can model the objective uncertainty well.
++
++---
++
++## Slide 8 — Ten fresh-device self-checks (1:10)
++
++**On slide**
++
++![Initial and optimized score ratios](assets/optimization_benchmark.png)
++
++- Mean measured score ratio: **0.874**; median: **0.857**; minimum: **0.745**.
++- Median budget: **334.5 measurements**, **7.53 million pixels**.
++- Initial median score ratio: 0.150.
++
++**Speaker notes**
++For each of ten deterministic fresh devices, we compare the repeated image-derived score at the returned point with a repeated score at the revealed optimum. `reveal()` is called only after optimization has returned; the oracle scans are outside the reported budget. The ratio is noisy and can exceed one, so it is not a claim about physical contrast beyond the true maximum. It is a reproducible way to check whether the measured objective has improved and whether we are close to the best visible setting.
++
++---
++
++## Slide 9 — Limits, next steps, and take-away (1:10)
++
++**On slide**
++- Detector prior is specific to known stick scale and orientation.
++- Drift tracking needs locally visible features; strongest-stick scoring is noisy.
++- Next: uncertainty-aware CNR, multi-resolution scans, Bayesian/trust-region proposals.
++
++**Take-away:** build objectives from device physics, quantify uncertainty, and keep oracle access outside the algorithm.
++
++**Speaker notes**
++The method transfers best when the physical geometry stays near the shared baseline. For a different device, I would first widen or learn the template bank from a small labelled calibration set, and use a locally calibrated contrast-to-noise estimate. The optimizer's weakest cases motivate uncertainty-aware proposal selection and an overview scan when registration confidence drops. The main lesson is that measurement design, drift handling, and honest validation matter as much as the optimizer itself.
++
++---
++
++## Q&A prompts to prepare
++
++- **Why not train a CNN?** The stick geometry and noise nuisances are explicit; a training-free detector is reproducible and easier to transfer at this baseline. Learned models are a fair next comparison, not a requirement.
++- **Why can the measured ratio exceed one?** The self-check uses finite noisy image samples and the oracle panner returned for the winning region; it is a proxy ratio, not the hidden physical contrast ratio.
++- **What does the detector miss?** Very weak/subpixel sticks, orientations or dimensions outside the bank, and ambiguous short charging-line fragments.
++- **What would you change on real hardware?** Estimate noise/lever arms from calibration scans, use adaptive scan size and uncertainty-aware CNR, and stop when the expected gain is below acquisition cost.
+diff --git a/slides.pptx b/slides.pptx
+new file mode 100644
+index 0000000..1bd4d53
+Binary files /dev/null and b/slides.pptx differ
+diff --git a/solutions/__init__.py b/solutions/__init__.py
+new file mode 100644
+index 0000000..07b981a
+--- /dev/null
++++ b/solutions/__init__.py
+@@ -0,0 +1,13 @@
++"""Reference solutions for the two C12 hackathon challenges."""
++
++from .detection import DetectionResult, InterdotDetector, pixel_metrics
++from .optimization import ContrastOptimizer, OptimizationResult, optimize
++
++__all__ = [
++    "ContrastOptimizer",
++    "DetectionResult",
++    "InterdotDetector",
++    "OptimizationResult",
++    "optimize",
++    "pixel_metrics",
++]
+diff --git a/solutions/detection.py b/solutions/detection.py
+new file mode 100644
+index 0000000..d231eae
+--- /dev/null
++++ b/solutions/detection.py
+@@ -0,0 +1,290 @@
++"""Physics-guided interdot detection for raw charge-stability diagrams.
++
++The detector is deliberately training-free: it searches for short, dark,
++approximately 45-degree rectangular ridges with a normalized matched-filter
++bank. A per-row median subtraction removes the shared horizontal acquisition
++noise without requiring image normalization or access to simulator metadata.
++
++The defaults are expressed in volts and match the shared generator. Pass the
++measurement pixel steps when using a non-default scan grid.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from functools import lru_cache
++
++import numpy as np
++import numpy.typing as npt
++from scipy.ndimage import correlate, gaussian_filter
++from skimage.feature import peak_local_max
++
++from csd.config import GENERATOR, GeneratorConfig
++
++FloatArray = npt.NDArray[np.float64]
++BoolArray = npt.NDArray[np.bool_]
++
++
++@dataclass(frozen=True)
++class DetectionResult:
++    """Outputs of one detector pass.
++
++    Attributes
++    ----------
++    mask:
++        Predicted interdot pixels, with the same shape as the input image.
++    score_map:
++        Best normalized dark-template response at each pixel. Larger values
++        indicate stronger evidence for an interdot centre.
++    peak_xy:
++        Candidate centres as ``(row, column)`` integer coordinates.
++    peak_scores:
++        Matched-filter scores at ``peak_xy``.
++    """
++
++    mask: BoolArray
++    score_map: FloatArray
++    peak_xy: npt.NDArray[np.int64]
++    peak_scores: FloatArray
++    peak_contrasts: FloatArray
++
++
++@dataclass(frozen=True)
++class _Template:
++    kernel: FloatArray
++    footprint: BoolArray
++    amplitude_gain: float
++
++
++@lru_cache(maxsize=24)
++def _template_bank(
++    step_h: float,
++    step_v: float,
++    config: GeneratorConfig,
++    n_lengths: int = 5,
++    n_widths: int = 4,
++    angle_offsets: tuple[float, ...] = (-0.20, -0.10, 0.0, 0.10, 0.20),
++) -> tuple[_Template, ...]:
++    """Construct a normalized bank from the generator's physical size ranges."""
++    # GeneratorConfig is frozen/hashable, so it is safe in the cache key.
++    length_min = config.avg_spacing * config.length_frac[0]
++    length_max = config.avg_spacing * config.length_frac[1]
++    width_min = config.avg_spacing * config.length_frac[0] * config.width_frac[0]
++    width_max = config.avg_spacing * config.length_frac[1] * config.width_frac[1]
++    lengths = np.linspace(length_min, length_max, n_lengths)
++    widths = np.linspace(width_min, width_max, n_widths)
++    angles = config.stick_theta + np.asarray(angle_offsets)
++
++    templates: list[_Template] = []
++    for length in lengths:
++        for width in widths:
++            for theta in angles:
++                # A one-pixel grid with a 2-pixel background annulus on all sides.
++                half_x = (
++                    int(
++                        np.ceil(
++                            (length * abs(np.cos(theta)) + width * abs(np.sin(theta)))
++                            / (2 * step_h)
++                        )
++                    )
++                    + 3
++                )
++                half_y = (
++                    int(
++                        np.ceil(
++                            (length * abs(np.sin(theta)) + width * abs(np.cos(theta)))
++                            / (2 * step_v)
++                        )
++                    )
++                    + 3
++                )
++                yy, xx = np.mgrid[-half_y : half_y + 1, -half_x : half_x + 1]
++                x = xx * step_h
++                y = yy * step_v
++                along = x * np.cos(theta) + y * np.sin(theta)
++                across = -x * np.sin(theta) + y * np.cos(theta)
++                stick = (np.abs(along) <= length / 2) & (np.abs(across) <= width / 2)
++                if not stick.any():
++                    continue
++
++                # Match the label generation's blur in the signal template. The
++                # annulus estimates local background and rejects broad features.
++                blurred = gaussian_filter(stick.astype(float), config.sigma_blur)
++                ring_parallel = max(2 * step_h, 2 * step_v)
++                ring_perp = max(2 * step_h, 2 * step_v)
++                outer = (np.abs(along) <= length / 2 + ring_parallel) & (
++                    np.abs(across) <= width / 2 + ring_perp
++                )
++                ring = outer & ~stick
++                if not ring.any():
++                    continue
++                kernel = blurred / blurred.sum() - ring.astype(float) / ring.sum()
++                norm = float(np.sqrt(np.sum(kernel * kernel)))
++                if norm == 0.0:
++                    continue
++                kernel = kernel / norm
++                footprint = blurred > 0.5
++                templates.append(
++                    _Template(
++                        kernel=np.asarray(kernel, dtype=np.float64),
++                        footprint=np.asarray(footprint, dtype=bool),
++                        amplitude_gain=float(np.sum(blurred * kernel)),
++                    )
++                )
++    return tuple(templates)
++
++
++class InterdotDetector:
++    """Detect interdot pixels in one raw CSD image.
++
++    Parameters
++    ----------
++    step_h, step_v:
++        Physical voltage step per image pixel. The defaults (2 mV) match the
++        challenge dataset and default simulator scan.
++    threshold:
++        Minimum peak response in noise-standard-deviation units. The default
++        was selected on a held-out validation split; it trades some recall for
++        fewer noise/charging-line false positives.
++    config:
++        Shared appearance configuration. Kept public for transfer tests; the
++        hackathon baseline should use the default.
++    min_distance:
++        Non-maximum suppression radius in pixels.
++    """
++
++    def __init__(
++        self,
++        *,
++        step_h: float = GENERATOR.scene_step,
++        step_v: float = GENERATOR.scene_step,
++        threshold: float = 4.0,
++        config: GeneratorConfig = GENERATOR,
++        min_distance: int = 4,
++        n_lengths: int = 5,
++        n_widths: int = 4,
++        angle_offsets: tuple[float, ...] = (-0.20, -0.10, 0.0, 0.10, 0.20),
++    ) -> None:
++        if step_h <= 0 or step_v <= 0:
++            raise ValueError("pixel steps must be positive")
++        if min_distance < 1:
++            raise ValueError("min_distance must be at least one pixel")
++        if n_lengths < 1 or n_widths < 1 or not angle_offsets:
++            raise ValueError("the template bank must contain at least one length, width, and angle")
++        self.step_h = float(step_h)
++        self.step_v = float(step_v)
++        self.threshold = float(threshold)
++        self.config = config
++        self.min_distance = int(min_distance)
++        self._bank = _template_bank(
++            self.step_h,
++            self.step_v,
++            config,
++            int(n_lengths),
++            int(n_widths),
++            tuple(float(value) for value in angle_offsets),
++        )
++        if not self._bank:
++            raise ValueError("the scan pixel size is too coarse for the interdot templates")
++
++    def analyze(self, image: npt.ArrayLike) -> DetectionResult:
++        """Return a binary mask and centre-evidence map for ``image``."""
++        frame = np.asarray(image, dtype=np.float64)
++        if frame.ndim != 2 or min(frame.shape) < 3:
++            raise ValueError("image must be a 2-D array at least 3 pixels wide and high")
++        if not np.isfinite(frame).all():
++            raise ValueError("image must contain only finite values")
++
++        # The simulator adds one noise value per row as well as pixel noise.
++        # Removing the robust row baseline suppresses that nuisance term while
++        # preserving sparse, sub-row interdot features.
++        residual = frame - np.median(frame, axis=1, keepdims=True)
++
++        best_score = np.full(frame.shape, -np.inf, dtype=np.float64)
++        best_template = np.zeros(frame.shape, dtype=np.int16)
++        for index, template in enumerate(self._bank):
++            response = -correlate(residual, template.kernel, mode="reflect")
++            update = response > best_score
++            best_score[update] = response[update]
++            best_template[update] = index
++
++        peaks = peak_local_max(
++            best_score,
++            min_distance=self.min_distance,
++            threshold_abs=self.threshold,
++            exclude_border=False,
++        )
++        if len(peaks):
++            peak_scores = best_score[peaks[:, 0], peaks[:, 1]]
++            # Deterministic ordering makes candidate lists reproducible.
++            order = np.argsort(-peak_scores, kind="stable")
++            peaks = peaks[order]
++            peak_scores = peak_scores[order]
++        else:
++            peak_scores = np.empty(0, dtype=np.float64)
++
++        peak_contrasts = np.empty(len(peaks), dtype=np.float64)
++        for index, ((row, col), score) in enumerate(zip(peaks, peak_scores)):
++            template = self._bank[int(best_template[row, col])]
++            peak_contrasts[index] = float(score / max(template.amplitude_gain, 1e-12))
++
++        predicted = np.zeros(frame.shape, dtype=bool)
++        for (row, col), score in zip(peaks, peak_scores):
++            if score < self.threshold:
++                continue
++            template = self._bank[int(best_template[row, col])]
++            footprint = template.footprint
++            half_y, half_x = footprint.shape[0] // 2, footprint.shape[1] // 2
++            y0, y1 = max(0, row - half_y), min(frame.shape[0], row + half_y + 1)
++            x0, x1 = max(0, col - half_x), min(frame.shape[1], col + half_x + 1)
++            fy0, fx0 = y0 - (row - half_y), x0 - (col - half_x)
++            predicted[y0:y1, x0:x1] |= footprint[fy0 : fy0 + y1 - y0, fx0 : fx0 + x1 - x0]
++
++        return DetectionResult(
++            mask=predicted,
++            score_map=best_score,
++            peak_xy=np.asarray(peaks, dtype=np.int64),
++            peak_scores=np.asarray(peak_scores, dtype=np.float64),
++            peak_contrasts=peak_contrasts,
++        )
++
++    def predict(self, image: npt.ArrayLike) -> BoolArray:
++        """Return only the binary interdot-pixel mask."""
++        return self.analyze(image).mask
++
++    def contrast_score(self, image: npt.ArrayLike, *, top_k: int = 3) -> float:
++        """Return a robust image-level interdot contrast proxy.
++
++        Matched-filter response is divided by its template gain to undo the
++        square-root-area advantage of long/wide sticks. The result estimates the
++        dip amplitude (the challenge's contrast definition), rather than how
++        many pixels a particular stick happens to cover.
++
++        Candidate amplitudes are ordered independently of detection confidence;
++        the default ``top_k=3`` is robust for a generic overview, while ``top_k=1``
++        matches the challenge's maximum-interdot objective.
++        """
++        if top_k < 1:
++            raise ValueError("top_k must be at least one")
++        result = self.analyze(image)
++        if not len(result.peak_contrasts):
++            return 0.0
++        count = min(top_k, len(result.peak_contrasts))
++        strongest = np.sort(result.peak_contrasts)[::-1][:count]
++        return float(np.mean(strongest))
++
++
++def pixel_metrics(prediction: npt.ArrayLike, target: npt.ArrayLike) -> dict[str, float]:
++    """Compute foreground precision, recall, F1, and IoU for binary masks."""
++    pred = np.asarray(prediction, dtype=bool)
++    truth = np.asarray(target, dtype=bool)
++    if pred.shape != truth.shape:
++        raise ValueError(f"prediction shape {pred.shape} != target shape {truth.shape}")
++    tp = int(np.count_nonzero(pred & truth))
++    fp = int(np.count_nonzero(pred & ~truth))
++    fn = int(np.count_nonzero(~pred & truth))
++    precision = tp / (tp + fp) if tp + fp else 0.0
++    recall = tp / (tp + fn) if tp + fn else 0.0
++    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
++    iou = tp / (tp + fp + fn) if tp + fp + fn else 0.0
++    return {"precision": precision, "recall": recall, "f1": f1, "iou": iou}
+diff --git a/solutions/evaluate_detection.py b/solutions/evaluate_detection.py
+new file mode 100644
+index 0000000..9eda727
+--- /dev/null
++++ b/solutions/evaluate_detection.py
+@@ -0,0 +1,128 @@
++"""Evaluate the held-out pixel-mask detector on a generated dataset.
++
++Example:
++    python -m solutions.evaluate_detection --dataset data/test
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import numpy as np
++import numpy.typing as npt
++from scipy.ndimage import label
++
++from csd import load_dataset
++from solutions.detection import InterdotDetector
++
++
++def _object_counts(prediction: npt.ArrayLike, target: npt.ArrayLike) -> tuple[int, int, int, int]:
++    """Return detected/total target and prediction connected-component counts."""
++    pred = np.asarray(prediction, dtype=bool)
++    truth = np.asarray(target, dtype=bool)
++    structure = np.ones((3, 3), dtype=np.uint8)
++    pred_labels, n_pred = label(pred, structure=structure)
++    truth_labels, n_truth = label(truth, structure=structure)
++
++    detected_truth = 0
++    for component in range(1, n_truth + 1):
++        detected_truth += int(np.any(pred[truth_labels == component]))
++    matched_prediction = 0
++    for component in range(1, n_pred + 1):
++        matched_prediction += int(np.any(truth[pred_labels == component]))
++    return detected_truth, n_truth, matched_prediction, n_pred
++
++
++def evaluate(dataset: str | Path, *, threshold: float = 4.0) -> dict[str, float]:
++    """Evaluate foreground pixel and connected-component metrics."""
++    ds = load_dataset(dataset)
++    images, masks = ds["images"], ds["masks"]
++    if len(images) != len(masks):
++        raise ValueError("images.npy and masks.npy have different sample counts")
++
++    detector = InterdotDetector(threshold=threshold)
++    tp = fp = fn = 0
++    detected = target_objects = matched = predicted_objects = 0
++    per_image: list[tuple[float, float, float, float]] = []
++
++    for image, target in zip(images, masks):
++        prediction = detector.predict(image)
++        truth = np.asarray(target, dtype=bool)
++        true_positive = int(np.count_nonzero(prediction & truth))
++        false_positive = int(np.count_nonzero(prediction & ~truth))
++        false_negative = int(np.count_nonzero(~prediction & truth))
++        tp += true_positive
++        fp += false_positive
++        fn += false_negative
++
++        precision = (
++            true_positive / (true_positive + false_positive)
++            if true_positive + false_positive
++            else 0.0
++        )
++        recall = (
++            true_positive / (true_positive + false_negative)
++            if true_positive + false_negative
++            else 0.0
++        )
++        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
++        iou = (
++            true_positive / (true_positive + false_positive + false_negative)
++            if true_positive + false_positive + false_negative
++            else 0.0
++        )
++        per_image.append((precision, recall, f1, iou))
++        hit, n_truth, match, n_pred = _object_counts(prediction, truth)
++        detected += hit
++        target_objects += n_truth
++        matched += match
++        predicted_objects += n_pred
++
++    macro = np.mean(np.asarray(per_image), axis=0)
++    micro_precision = tp / (tp + fp) if tp + fp else 0.0
++    micro_recall = tp / (tp + fn) if tp + fn else 0.0
++    micro_f1 = (
++        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
++        if micro_precision + micro_recall
++        else 0.0
++    )
++    micro_iou = tp / (tp + fp + fn) if tp + fp + fn else 0.0
++    return {
++        "n_images": float(len(images)),
++        "threshold": float(threshold),
++        "macro_precision": float(macro[0]),
++        "macro_recall": float(macro[1]),
++        "macro_f1": float(macro[2]),
++        "macro_iou": float(macro[3]),
++        "micro_precision": micro_precision,
++        "micro_recall": micro_recall,
++        "micro_f1": micro_f1,
++        "micro_iou": micro_iou,
++        "object_precision": matched / predicted_objects if predicted_objects else 0.0,
++        "object_recall": detected / target_objects if target_objects else 0.0,
++        "n_target_objects": float(target_objects),
++        "n_predicted_objects": float(predicted_objects),
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--dataset", type=Path, required=True, help="folder with images.npy and masks.npy"
++    )
++    parser.add_argument(
++        "--threshold", type=float, default=4.0, help="matched-filter detection threshold"
++    )
++    args = parser.parse_args()
++
++    metrics = evaluate(args.dataset, threshold=args.threshold)
++    print(f"dataset: {args.dataset}  samples: {int(metrics['n_images'])}")
++    for key, value in metrics.items():
++        if key in {"n_images", "threshold"}:
++            continue
++        print(f"{key:>20}: {value:.4f}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/solutions/evaluate_optimization.py b/solutions/evaluate_optimization.py
+new file mode 100644
+index 0000000..fd5f4df
+--- /dev/null
++++ b/solutions/evaluate_optimization.py
+@@ -0,0 +1,136 @@
++"""Post-run self-check for Challenge 2 across reproducible fresh devices.
++
++The optimizer itself never calls ``reveal``. This separate benchmark calls it
++only after optimization has returned, then compares the image-derived score at
++the submitted working point with a repeated measurement at the revealed oracle
++point. Those oracle scans are reported separately from the optimizer's budget.
++
++Example:
++    python -m solutions.evaluate_optimization --count 10 --start-seed 0
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++from pathlib import Path
++
++import numpy as np
++
++from csd import BARRIERS, new_experiment
++from solutions.optimization import ContrastOptimizer
++
++
++def _repeat_score(
++    optimizer: ContrastOptimizer, experiment, point: dict[str, float], repeats: int
++) -> float:
++    scores = []
++    for _ in range(repeats):
++        image = experiment.measure(
++            **point,
++            span_h=optimizer.scan_span,
++            span_v=optimizer.scan_span,
++            step_h=optimizer.scan_step,
++            step_v=optimizer.scan_step,
++        )
++        scores.append(optimizer.detector.contrast_score(image, top_k=1))
++    return float(np.mean(scores))
++
++
++def evaluate_seeds(
++    *,
++    count: int = 10,
++    start_seed: int = 0,
++    optimizer_seed: int = 0,
++    global_samples: int = 48,
++    oracle_repeats: int = 3,
++) -> list[dict[str, float]]:
++    """Run deterministic devices and perform a post-hoc reveal-based check."""
++    if count < 1 or oracle_repeats < 1:
++        raise ValueError("count and oracle_repeats must be positive")
++
++    results: list[dict[str, float]] = []
++    for device_seed in range(start_seed, start_seed + count):
++        experiment = new_experiment(seed=device_seed)
++        optimizer = ContrastOptimizer(seed=optimizer_seed, global_samples=global_samples)
++        result = optimizer.optimize(experiment)
++        optimizer_measurements = result.n_measurements
++        optimizer_pixels = result.n_pixels
++
++        # Explicitly post-run only: this is a self-check baseline, never part of
++        # ContrastOptimizer.optimize or its candidate-selection logic.
++        truth = experiment.reveal()
++        oracle_point = dict(experiment.start)
++        oracle_point.update(truth["optimum_barriers"])
++        oracle_point.update(truth["optimum_plungers"])
++
++        measured_found = _repeat_score(optimizer, experiment, result.working_point, oracle_repeats)
++        measured_oracle = _repeat_score(optimizer, experiment, oracle_point, oracle_repeats)
++        ratio = measured_found / measured_oracle if measured_oracle > 0 else 0.0
++        distance = float(
++            np.linalg.norm(
++                [result.working_point[gate] - truth["optimum_barriers"][gate] for gate in BARRIERS]
++            )
++        )
++        results.append(
++            {
++                "device_seed": float(device_seed),
++                "optimizer_seed": float(optimizer_seed),
++                "initial_score": result.initial_score,
++                "found_score": measured_found,
++                "oracle_score": measured_oracle,
++                "measured_score_ratio": ratio,
++                "barrier_distance_v": distance,
++                "n_measurements": float(optimizer_measurements),
++                "n_pixels": float(optimizer_pixels),
++                "oracle_factor": float(truth["max_contrast_factor"]),
++            }
++        )
++        print(
++            f"device {device_seed:>3}: score ratio={ratio:.3f}, "
++            f"barrier distance={distance:.3f} V, "
++            f"optimizer measurements={optimizer_measurements}, "
++            f"pixels={optimizer_pixels:,}"
++        )
++
++    ratios = np.asarray([row["measured_score_ratio"] for row in results])
++    pixels = np.asarray([row["n_pixels"] for row in results])
++    print(
++        "summary: "
++        f"mean score ratio={ratios.mean():.3f}, "
++        f"median={np.median(ratios):.3f}, min={ratios.min():.3f}; "
++        f"median optimizer pixels={np.median(pixels):,.0f}"
++    )
++    return results
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--count", type=int, default=10, help="number of independent devices")
++    parser.add_argument("--start-seed", type=int, default=0, help="first device seed")
++    parser.add_argument("--optimizer-seed", type=int, default=0, help="Sobol-design seed")
++    parser.add_argument(
++        "--global-samples", type=int, default=48, help="Sobol sample count per device"
++    )
++    parser.add_argument("--oracle-repeats", type=int, default=3, help="post-run score repetitions")
++    parser.add_argument("--csv", type=Path, default=None, help="optional CSV output path")
++    args = parser.parse_args()
++
++    rows = evaluate_seeds(
++        count=args.count,
++        start_seed=args.start_seed,
++        optimizer_seed=args.optimizer_seed,
++        global_samples=args.global_samples,
++        oracle_repeats=args.oracle_repeats,
++    )
++    if args.csv is not None:
++        args.csv.parent.mkdir(parents=True, exist_ok=True)
++        with args.csv.open("w", newline="") as stream:
++            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
++            writer.writeheader()
++            writer.writerows(rows)
++        print(f"wrote {args.csv}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/solutions/optimization.py b/solutions/optimization.py
+new file mode 100644
+index 0000000..49205d5
+--- /dev/null
++++ b/solutions/optimization.py
+@@ -0,0 +1,512 @@
++"""Budget-aware contrast search using only the participant-facing experiment API.
++
++The optimizer combines three experimentally motivated pieces:
++
++* empirical plunger recentering from image registration (barrier changes move
++  the CSD in the plunger plane);
++* a scrambled Sobol design for global exploration of the three barrier gates;
++* local coordinate-pattern refinement around distinct high-scoring regions.
++
++No simulator internals, hidden optimum, or ``reveal()`` calls are used here.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from math import ceil, log2
++
++import numpy as np
++import numpy.typing as npt
++from scipy.ndimage import gaussian_filter
++from scipy.signal import correlate
++from scipy.stats import qmc
++
++from csd import BARRIERS
++
++from .detection import InterdotDetector
++
++FloatArray = npt.NDArray[np.float64]
++
++
++@dataclass(frozen=True)
++class OptimizationResult:
++    """Summary of an optimization run.
++
++    ``working_point`` is ready to pass to ``exp.measure``. ``history`` contains
++    all evaluated barrier vectors and their image-derived contrast scores; it is
++    useful for plots and reproducibility, and contains no simulator state.
++    """
++
++    working_point: dict[str, float]
++    score: float
++    initial_score: float
++    n_measurements: int
++    n_pixels: int
++    history: FloatArray = field(repr=False)
++
++    @property
++    def barriers(self) -> dict[str, float]:
++        return {gate: self.working_point[gate] for gate in BARRIERS}
++
++
++class _DriftTracker:
++    """Estimate barrier-to-plunger drift from consecutive measured images."""
++
++    def __init__(
++        self,
++        experiment,
++        *,
++        step_h: float,
++        step_v: float,
++        barrier_scale: float,
++    ) -> None:
++        self.experiment = experiment
++        self.start = dict(experiment.start)
++        self.step_h = float(step_h)
++        self.step_v = float(step_v)
++        self.barrier_scale = float(barrier_scale)
++
++        self._barriers: list[FloatArray] = []
++        self._drifts: list[FloatArray] = []
++        self._previous_barriers: FloatArray | None = None
++        self._previous_pan: FloatArray | None = None
++        self._previous_drift: FloatArray | None = None
++        self._previous_registration: FloatArray | None = None
++
++    @staticmethod
++    def _registration_image(image: npt.ArrayLike) -> FloatArray:
++        """Suppress row stripes, then register the stable edge/ridge geometry."""
++        frame = np.asarray(image, dtype=np.float64)
++        row_centered = frame - np.median(frame, axis=1, keepdims=True)
++        smoothed = gaussian_filter(row_centered, sigma=1.0)
++        grad_y, grad_x = np.gradient(smoothed)
++        edges = np.hypot(grad_x, grad_y)
++        edges -= float(np.mean(edges))
++        return edges / max(float(np.std(edges)), 1e-12)
++
++    @staticmethod
++    def _registration_shift(reference: FloatArray, moving: FloatArray) -> tuple[FloatArray, float]:
++        """Estimate a small 2-D translation by bounded, unnormalized correlation.
++
++        Phase-only correlation can lock onto a different bright patch when a
++        regional contrast changes sharply. A bounded real-space cross-correlation
++        uses the persistent edge geometry and keeps the estimate near the expected
++        small scan-to-scan drift.
++        """
++        corr = correlate(reference, moving, mode="full", method="fft")
++        height, width = reference.shape
++        shift_limit = min(60, height // 2 - 1, width // 2 - 1)
++        rows = np.arange(corr.shape[0]) - (moving.shape[0] - 1)
++        cols = np.arange(corr.shape[1]) - (moving.shape[1] - 1)
++        allowed = (np.abs(rows[:, None]) <= shift_limit) & (np.abs(cols[None, :]) <= shift_limit)
++        bounded = np.where(allowed, corr, -np.inf)
++        row, col = np.unravel_index(int(np.argmax(bounded)), bounded.shape)
++        peak = float(bounded[row, col])
++        runner_up = bounded.copy()
++        runner_up[max(0, row - 3) : row + 4, max(0, col - 3) : col + 4] = -np.inf
++        second_peak = float(np.max(runner_up))
++        confidence = peak / max(second_peak, 1e-12)
++
++        # Subpixel parabolic interpolation around the discrete correlation peak.
++        def offset(before: float, center: float, after: float) -> float:
++            denominator = before - 2.0 * center + after
++            if abs(denominator) < 1e-12:
++                return 0.0
++            return float(np.clip(0.5 * (before - after) / denominator, -0.5, 0.5))
++
++        dy = float(rows[row])
++        dx = float(cols[col])
++        if 0 < row < corr.shape[0] - 1:
++            dy += offset(corr[row - 1, col], corr[row, col], corr[row + 1, col])
++        if 0 < col < corr.shape[1] - 1:
++            dx += offset(corr[row, col - 1], corr[row, col], corr[row, col + 1])
++        return np.array([dy, dx], dtype=np.float64), confidence
++
++    def _features(self, barriers: npt.ArrayLike, quadratic: bool) -> FloatArray:
++        b = np.asarray(barriers, dtype=np.float64) / self.barrier_scale
++        if not quadratic:
++            return b
++        b1, b2, b3 = b
++        return np.array(
++            [b1, b2, b3, b1 * b1, b2 * b2, b3 * b3, 2 * b1 * b2, 2 * b1 * b3, 2 * b2 * b3],
++            dtype=np.float64,
++        )
++
++    def _model(self) -> tuple[FloatArray, bool]:
++        """Fit a regularized linear/quadratic empirical drift model."""
++        if not self._barriers:
++            return np.zeros((3, 2), dtype=np.float64), False
++
++        barriers = np.asarray(self._barriers)
++        # The quadratic terms are only admitted after the sampled design spans
++        # them. This prevents an ill-conditioned early fit from panning the scene
++        # off-screen before the three lever arms have been measured.
++        candidates = np.column_stack([self._features(b, quadratic=True) for b in barriers]).T
++        quadratic = len(barriers) >= 12 and np.linalg.matrix_rank(candidates, tol=1e-5) == 9
++        design = candidates if quadratic else barriers / self.barrier_scale
++        target = np.asarray(self._drifts)
++
++        # A small ridge term handles correlated samples along a scan path. Huber-
++        # style reweighting prevents an occasional bad registration from
++        # dominating the lever-arm estimate.
++        penalty = 1e-3 if quadratic else 1e-5
++        weights = np.ones(len(design), dtype=np.float64)
++        coefficients = np.zeros((design.shape[1], 2), dtype=np.float64)
++        for _ in range(3):
++            weighted_design = design * weights[:, None]
++            lhs = design.T @ weighted_design + penalty * np.eye(design.shape[1])
++            rhs = design.T @ (target * weights[:, None])
++            coefficients = np.linalg.solve(lhs, rhs)
++            residual = np.linalg.norm(target - design @ coefficients, axis=1)
++            median = float(np.median(residual))
++            scale = max(1.4826 * median, 2 * min(self.step_h, self.step_v))
++            weights = np.minimum(1.0, 2.5 * scale / np.maximum(residual, 1e-12))
++        return coefficients, quadratic
++
++    def predict_drift(self, barriers: npt.ArrayLike) -> FloatArray:
++        """Predict the (g2, g4) translation in volts from observed measurements."""
++        coefficients, quadratic = self._model()
++        if not self._barriers:
++            return np.zeros(2, dtype=np.float64)
++        prediction = self._features(barriers, quadratic) @ coefficients
++        # A loose physical guard protects the scan from a transient regression
++        # outlier; the default landscape's drift is generally within this box.
++        return np.clip(prediction, -1.0, 1.0)
++
++    def working_point(self, barriers: npt.ArrayLike) -> tuple[dict[str, float], FloatArray]:
++        pan = self.predict_drift(barriers)
++        point = dict(self.start)
++        point.update({gate: float(value) for gate, value in zip(BARRIERS, barriers)})
++        point["g2"] = float(self.start["g2"] + pan[0])
++        point["g4"] = float(self.start["g4"] + pan[1])
++        return point, pan
++
++    def observe(
++        self,
++        image: npt.ArrayLike,
++        barriers: npt.ArrayLike,
++        pan: npt.ArrayLike,
++        *,
++        force: bool = False,
++    ) -> bool:
++        """Use relative image registration to update the drift model.
++
++        If the image moves by ``s`` between scans while the panner changes by
++        ``dp``, the physical barrier-induced drift changed by ``s + dp``. Relative
++        registration is used rather than comparing against the initial frame:
++        local scans have much more stable contrast patterns. Return ``False``
++        without changing tracker state if the peak is ambiguous, so the caller can
++        average one more frame at the same working point and try again.
++        """
++        current_barriers = np.asarray(barriers, dtype=np.float64)
++        current_pan = np.asarray(pan, dtype=np.float64)
++        registration = self._registration_image(image)
++
++        if self._previous_registration is None:
++            current_drift = np.zeros(2, dtype=np.float64)
++        else:
++            shift_yx, confidence = self._registration_shift(
++                self._previous_registration, registration
++            )
++            if confidence < 1.18 and not force:
++                return False
++            image_motion = np.array(
++                [-shift_yx[1] * self.step_h, -shift_yx[0] * self.step_v],
++                dtype=np.float64,
++            )
++            delta_pan = current_pan - self._previous_pan
++            delta_barriers = current_barriers - self._previous_barriers
++
++            # Large, physically implausible jumps are usually a registration
++            # ambiguity (e.g. a faint patch disappeared). Ask for an averaged
++            # frame before using such a shift; on the forced retry, keep the
++            # empirical drift prediction rather than fitting the outlier.
++            max_motion = 0.08 + 2.2 * float(np.sum(np.abs(delta_barriers)))
++            implausible = (
++                not np.isfinite(image_motion).all()
++                or np.linalg.norm(image_motion) > max_motion
++                or np.max(np.abs(image_motion)) > 0.30
++            )
++            if implausible and not force:
++                return False
++            if implausible:
++                image_motion = np.zeros(2, dtype=np.float64)
++
++            current_drift = self._previous_drift + image_motion + delta_pan
++
++        self._barriers.append(current_barriers.copy())
++        self._drifts.append(np.asarray(current_drift, dtype=np.float64))
++        self._previous_barriers = current_barriers.copy()
++        self._previous_pan = current_pan.copy()
++        self._previous_drift = np.asarray(current_drift, dtype=np.float64)
++        self._previous_registration = registration
++        return True
++
++
++class ContrastOptimizer:
++    """Global-plus-local optimizer for the default C12 5-gate challenge.
++
++    All objective measurements use a full-resolution CSD frame and the detector's
++    strongest normalized interdot matched-filter response. The full frame also supports empirical
++    drift tracking, so the g2/g4 panners are recentered while the barriers move.
++    """
++
++    def __init__(
++        self,
++        *,
++        barrier_bounds: tuple[float, float] = (-0.5, 0.5),
++        scan_span: float = 0.3,
++        scan_step: float = 2e-3,
++        global_samples: int = 48,
++        max_path_step: float = 0.08,
++        local_starts: int = 2,
++        local_rounds: int = 4,
++        seed: int = 0,
++    ) -> None:
++        low, high = map(float, barrier_bounds)
++        if not low < high:
++            raise ValueError("barrier_bounds must be an increasing pair")
++        if not low <= 0.0 <= high:
++            raise ValueError("barrier_bounds must include the zero-barrier start point")
++        if scan_span <= 0 or scan_step <= 0:
++            raise ValueError("scan_span and scan_step must be positive")
++        if global_samples < 1 or max_path_step <= 0:
++            raise ValueError("global_samples and max_path_step must be positive")
++        if local_starts < 1 or local_rounds < 1:
++            raise ValueError("local_starts and local_rounds must be positive")
++
++        self.bounds = (low, high)
++        self.scan_span = float(scan_span)
++        self.scan_step = float(scan_step)
++        self.global_samples = int(global_samples)
++        self.max_path_step = float(max_path_step)
++        self.local_starts = int(local_starts)
++        self.local_rounds = int(local_rounds)
++        self.seed = int(seed)
++        self.detector = InterdotDetector(
++            step_h=self.scan_step,
++            step_v=self.scan_step,
++            threshold=1.0 if self.scan_step >= 3e-3 else 4.0,
++            n_lengths=4,
++            n_widths=3,
++            angle_offsets=(-0.15, 0.0, 0.15),
++        )
++
++    def _sample_barriers(self) -> FloatArray:
++        power = ceil(log2(self.global_samples))
++        unit = qmc.Sobol(d=3, scramble=True, seed=self.seed).random_base2(power)
++        unit = unit[: self.global_samples]
++        low, high = self.bounds
++        return low + unit * (high - low)
++
++    def _ordered_path(self) -> list[FloatArray]:
++        """Greedy nearest-neighbour route with short interpolated tracking steps."""
++        remaining = [p for p in self._sample_barriers()]
++        current = np.zeros(3, dtype=np.float64)
++        path: list[FloatArray] = []
++        while remaining:
++            index = int(np.argmin([np.linalg.norm(point - current) for point in remaining]))
++            target = remaining.pop(index)
++            n_step = max(1, ceil(float(np.max(np.abs(target - current))) / self.max_path_step))
++            for step in range(1, n_step + 1):
++                path.append(current + (target - current) * (step / n_step))
++            current = target
++        return path
++
++    def _record_score(self, image: npt.ArrayLike) -> float:
++        # The challenge defines the objective as the strongest interdot contrast,
++        # not the scene-wide mean. Averaging several frame maxima is handled in
++        # the local-refinement/final confirmation steps.
++        return self.detector.contrast_score(image, top_k=1)
++
++    def optimize(self, experiment, *, verbose: bool = False) -> OptimizationResult:
++        """Tune one fresh experiment and return the best measured working point.
++
++        ``experiment`` is used only through its documented ``start`` and
++        ``measure`` API. It must use the default 0.3 V / 2 mV scan distribution
++        (or matching ``scan_span``/``scan_step`` supplied to this optimizer).
++        """
++        lo, hi = self.bounds
++        barrier_scale = max(abs(lo), abs(hi), 1e-6)
++        tracker = _DriftTracker(
++            experiment,
++            step_h=self.scan_step,
++            step_v=self.scan_step,
++            barrier_scale=barrier_scale,
++        )
++        history: list[tuple[float, float, float, float]] = []
++        n_measurements = 0
++        current_barriers = np.zeros(3, dtype=np.float64)
++
++        def acquire(barriers: npt.ArrayLike) -> tuple[float, dict[str, float]]:
++            nonlocal n_measurements, current_barriers
++            b = np.asarray(barriers, dtype=np.float64)
++            point, pan = tracker.working_point(b)
++            image = experiment.measure(
++                **point,
++                span_h=self.scan_span,
++                span_v=self.scan_span,
++                step_h=self.scan_step,
++                step_v=self.scan_step,
++            )
++            n_frames = 1
++            registered = tracker.observe(image, b, pan)
++            if not registered:
++                # Ambiguous motion estimates are rare but can occur while the
++                # sticks are close to the noise floor. Average a second frame at
++                # the same point before attempting to update the drift model.
++                second = experiment.measure(
++                    **point,
++                    span_h=self.scan_span,
++                    span_v=self.scan_span,
++                    step_h=self.scan_step,
++                    step_v=self.scan_step,
++                )
++                image = (np.asarray(image) + np.asarray(second)) / 2.0
++                n_frames += 1
++                registered = tracker.observe(image, b, pan)
++                if not registered:
++                    tracker.observe(image, b, pan, force=True)
++            score = self._record_score(image)
++            n_measurements += n_frames
++            current_barriers = b.copy()
++            history.append((float(b[0]), float(b[1]), float(b[2]), score))
++            return score, point
++
++        def travel_and_score(target: npt.ArrayLike) -> float:
++            """Measure each short move so drift tracking never loses overlap."""
++            nonlocal current_barriers
++            target = np.asarray(target, dtype=np.float64)
++            delta = target - current_barriers
++            n_step = max(1, ceil(float(np.max(np.abs(delta))) / self.max_path_step))
++            score = float("nan")
++            origin = current_barriers.copy()
++            for step in range(1, n_step + 1):
++                position = origin + delta * (step / n_step)
++                score, _ = acquire(position)
++            return score
++
++        # Start scan establishes the reference image and the zero-drift origin.
++        initial_score, _ = acquire(current_barriers)
++        best_barriers = current_barriers.copy()
++        best_score = initial_score
++
++        # Small orthogonal probes identify the local lever arms before the global
++        # space-filling walk. The returned images are still ordinary observations.
++        probe = min(0.04, (hi - lo) / 12)
++        calibration = [
++            np.array([probe, 0.0, 0.0]),
++            np.array([0.0, probe, 0.0]),
++            np.array([0.0, 0.0, probe]),
++            np.array([-probe, 0.0, 0.0]),
++            np.array([0.0, -probe, 0.0]),
++            np.array([0.0, 0.0, -probe]),
++        ]
++        for b in calibration:
++            score = travel_and_score(b)
++            if score > best_score:
++                best_score, best_barriers = score, b.copy()
++
++        # Global exploration. Interpolated points are scored as well: this makes
++        # the route informative rather than charging pixels only for navigation.
++        for b in self._ordered_path():
++            score = travel_and_score(b)
++            if score > best_score:
++                best_score, best_barriers = score, np.asarray(b).copy()
++        global_best = max(history, key=lambda item: item[3])
++        if global_best[3] > best_score:
++            best_score = global_best[3]
++            best_barriers = np.asarray(global_best[:3], dtype=np.float64)
++        if verbose:
++            print(f"global phase: {len(history)} scored scans, best score {best_score:.2f}")
++
++        # Select distinct high-scoring starts so multiple spatially separated
++        # contrast regions can be refined, not just the first local maximum.
++        scored = sorted(history, key=lambda item: item[3], reverse=True)
++        starts: list[FloatArray] = []
++        min_separation = 0.18 * (hi - lo)
++        for g1, g3, g5, score in scored:
++            candidate = np.array([g1, g3, g5], dtype=np.float64)
++            if all(np.linalg.norm(candidate - chosen) >= min_separation for chosen in starts):
++                starts.append(candidate)
++                if len(starts) >= self.local_starts:
++                    break
++        if not starts:
++            starts = [best_barriers.copy()]
++
++        for start_barriers in starts:
++            # Re-measure the seed to reduce winner's-curse bias from the global
++            # sweep's single noisy frame.
++            seed_score = float(np.mean([travel_and_score(start_barriers) for _ in range(2)]))
++            point = start_barriers.copy()
++            point_score = seed_score
++            step_size = 0.08 * (hi - lo)
++            tolerance = 0.10
++
++            for _ in range(self.local_rounds):
++                if step_size < 0.01 * (hi - lo):
++                    break
++                proposals: list[tuple[FloatArray, float]] = []
++                for axis in range(3):
++                    for direction in (-1.0, 1.0):
++                        trial = point.copy()
++                        trial[axis] = np.clip(trial[axis] + direction * step_size, lo, hi)
++                        if np.allclose(trial, point, atol=1e-10):
++                            continue
++                        # Two frames stabilize the fine-scale comparison; the
++                        # global search is deliberately single-frame to save time.
++                        trial_score = float(np.mean([travel_and_score(trial) for _ in range(2)]))
++                        proposals.append((trial, trial_score))
++                if proposals:
++                    candidate, candidate_score = max(proposals, key=lambda item: item[1])
++                    if candidate_score > point_score + tolerance:
++                        point, point_score = candidate.copy(), candidate_score
++                        if point_score > best_score:
++                            best_score, best_barriers = point_score, point.copy()
++                    else:
++                        step_size *= 0.5
++            if point_score > best_score:
++                best_score, best_barriers = point_score, point.copy()
++            if verbose:
++                print(
++                    "local phase:",
++                    {g: round(float(v), 3) for g, v in zip(BARRIERS, point)},
++                    f"score={point_score:.2f}",
++                )
++
++        # Return a recentered final working point. Two repeat measurements also
++        # give a less noisy final score than selecting the largest single frame.
++        final_scores: list[float] = []
++        for _ in range(3):
++            final_scores.append(travel_and_score(best_barriers))
++        final_score = float(np.mean(final_scores))
++        final_point, _ = tracker.working_point(best_barriers)
++
++        if verbose:
++            print(
++                f"final: score={final_score:.2f}, "
++                f"barriers={{{', '.join(f'{g}: {final_point[g]:.3f}' for g in BARRIERS)}}}, "
++                f"measurements={n_measurements}, pixels={n_measurements * round(self.scan_span / self.scan_step) ** 2:,}"
++            )
++
++        return OptimizationResult(
++            working_point=final_point,
++            score=final_score,
++            initial_score=float(initial_score),
++            n_measurements=n_measurements,
++            n_pixels=n_measurements * round(self.scan_span / self.scan_step) ** 2,
++            history=np.asarray(history, dtype=np.float64),
++        )
++
++
++def optimize(
++    experiment,
++    *,
++    seed: int = 0,
++    global_samples: int = 48,
++    verbose: bool = False,
++) -> OptimizationResult:
++    """Convenience wrapper for the default challenge limits and scan settings."""
++    return ContrastOptimizer(seed=seed, global_samples=global_samples).optimize(
++        experiment, verbose=verbose
++    )
+diff --git a/tests/test_solution.py b/tests/test_solution.py
+new file mode 100644
+index 0000000..9068bda
+--- /dev/null
++++ b/tests/test_solution.py
+@@ -0,0 +1,107 @@
++from __future__ import annotations
++
++import numpy as np
++from scipy.ndimage import gaussian_filter, shift
++
++from solutions.detection import InterdotDetector, pixel_metrics
++from solutions.optimization import ContrastOptimizer, _DriftTracker
++
++
++def _synthetic_stick_image(seed: int = 4) -> tuple[np.ndarray, np.ndarray]:
++    rng = np.random.default_rng(seed)
++    shape = (150, 150)
++    step = 0.002
++    yy, xx = np.mgrid[: shape[0], : shape[1]]
++    x = (xx - 75) * step
++    y = (yy - 75) * step
++    theta = np.pi / 4
++    along = x * np.cos(theta) + y * np.sin(theta)
++    across = -x * np.sin(theta) + y * np.cos(theta)
++    rectangle = (np.abs(along) <= 0.012 / 2) & (np.abs(across) <= 0.002 / 2)
++    noise = rng.normal(0.0, 0.9, size=shape) + rng.normal(0.0, 0.7, size=(shape[0], 1))
++    image = gaussian_filter(noise - 12.0 * rectangle, sigma=0.5)
++    target = gaussian_filter(rectangle.astype(float), sigma=0.5) > 0.5
++    return image, target
++
++
++def test_detector_recovers_a_dark_diagonal_stick() -> None:
++    image, target = _synthetic_stick_image()
++    prediction = InterdotDetector().predict(image)
++    metrics = pixel_metrics(prediction, target)
++    assert metrics["recall"] > 0.65
++    assert metrics["precision"] > 0.45
++
++
++def test_pixel_metrics_are_well_defined_for_empty_masks() -> None:
++    empty = np.zeros((8, 8), dtype=bool)
++    assert pixel_metrics(empty, empty) == {
++        "precision": 0.0,
++        "recall": 0.0,
++        "f1": 0.0,
++        "iou": 0.0,
++    }
++    target = empty.copy()
++    target[2:4, 3:5] = True
++    assert pixel_metrics(target, target) == {
++        "precision": 1.0,
++        "recall": 1.0,
++        "f1": 1.0,
++        "iou": 1.0,
++    }
++
++
++def test_bounded_registration_uses_documented_shift_sign() -> None:
++    rng = np.random.default_rng(12)
++    reference = gaussian_filter(rng.normal(size=(80, 80)), sigma=1.0)
++    moving = shift(reference, shift=(5, -8), order=0, mode="wrap")
++    shift_yx, confidence = _DriftTracker._registration_shift(reference, moving)
++    # The result is the shift to apply to the moving image to align it with the reference.
++    assert np.allclose(shift_yx, (-5, 8), atol=0.2)
++    assert confidence > 1.1
++
++
++def test_sobol_candidates_are_reproducible_and_bounded() -> None:
++    first = ContrastOptimizer(global_samples=16, seed=123)._sample_barriers()
++    second = ContrastOptimizer(global_samples=16, seed=123)._sample_barriers()
++    assert np.array_equal(first, second)
++    assert np.all(first >= -0.5)
++    assert np.all(first <= 0.5)
++
++
++class _PublicApiOnlyExperiment:
++    """Small deterministic device stub with no reveal or simulator attributes."""
++
++    def __init__(self) -> None:
++        self.start = {"g1": 0.0, "g2": 0.15, "g3": 0.0, "g4": 0.15, "g5": 0.0}
++        self._rng = np.random.default_rng(7)
++        self._shape = (150, 150)
++
++    def measure(self, **kwargs: float) -> np.ndarray:
++        image = self._rng.normal(0.0, 0.9, size=self._shape)
++        image += self._rng.normal(0.0, 0.7, size=(self._shape[0], 1))
++        barriers = np.array([kwargs["g1"], kwargs["g3"], kwargs["g5"]])
++        center = np.array([0.12, -0.08, 0.15])
++        contrast = 3.0 + 20.0 * np.exp(-np.sum(((barriers - center) / 0.08) ** 2))
++        yy, xx = np.mgrid[:150, :150]
++        along = (xx - 75) / np.sqrt(2) + (yy - 75) / np.sqrt(2)
++        across = -(xx - 75) / np.sqrt(2) + (yy - 75) / np.sqrt(2)
++        stick = (np.abs(along) <= 3.0) & (np.abs(across) <= 0.7)
++        image[stick] -= contrast
++        return gaussian_filter(image, sigma=0.5)
++
++
++def test_optimizer_uses_only_start_and_measure() -> None:
++    experiment = _PublicApiOnlyExperiment()
++    optimizer = ContrastOptimizer(
++        barrier_bounds=(-0.2, 0.2),
++        global_samples=2,
++        max_path_step=0.5,
++        local_starts=1,
++        local_rounds=1,
++        seed=3,
++    )
++    result = optimizer.optimize(experiment)
++    assert set(result.working_point) == {"g1", "g2", "g3", "g4", "g5"}
++    assert np.isfinite(result.score)
++    assert result.n_measurements > 0
++    assert result.history.shape[1] == 4
